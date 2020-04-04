@@ -28,7 +28,7 @@ struct options {
   bool copy_permissions = true;
   /**
    * Use ansi escapes to clear the line nicely :3
-   * */
+   **/
   bool ansi_escape = true;
   bool is_copying = false;
   const char *original_dir = nullptr,
@@ -52,6 +52,9 @@ int main(int argc, char **argv) {
   struct sigaction action;
   memset(&action, 0, sizeof(action));
   action.sa_handler = &handle_termination;
+  if (!isatty(fileno(stdout))) {
+    options.print_info = false;
+  }
   sigaction(SIGTERM, &action, NULL);
   fs::path other = options.destination_dir,
            src = options.original_dir;
