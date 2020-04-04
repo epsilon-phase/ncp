@@ -26,6 +26,7 @@ struct options {
   const char *original_dir = nullptr,
              *destination_dir = nullptr;
 };
+void print_help(const char *progname);
 void mmap_copy(int original, int newfile, const struct stat &stat, const options &opts);
 #ifdef HAS_SENDFILE
 void sendfile_copy(int original, int newfile, const struct stat &stat, const options &opts);
@@ -125,6 +126,8 @@ void sendfile_copy(int original, int newfile, const struct stat &stat, const opt
 #endif
 options parse_arguments(int argc, char **argv) {
   options result;
+  if (argc == 1)
+    print_help(argv[0]);
   static struct option long_options[] = {
       {"help", no_argument, nullptr, 'h'},
       {"preserve-permissions", no_argument, reinterpret_cast<int *>(&result.copy_permissions), true},
@@ -145,15 +148,7 @@ options parse_arguments(int argc, char **argv) {
         break;
       break;
     case 'h':
-      std::cout << "Syntax: " << argv[0] << " [options] (source directory) (destination directory)\n"
-                << "Options:\n"
-                << "\t--disregard-permissions\t Do not copy permissions. This is usually not what you want."
-                << "\t--silent\t Don't print anything\n"
-                << "\t--loud\t On by default. Print things\n"
-                << "\t--chunk-size <size>\t Set the amount copied at once defaults to " << std::numeric_limits<ssize_t>::max() << "\n"
-                << "\t--preserve-permissions\tCopy the original permissions from each file and directory\n"
-                << std::endl;
-      exit(0);
+      print_help(argv[0]);
       break;
     case 'c': {
       auto q = strtol(optarg, NULL, 10);
@@ -174,16 +169,27 @@ options parse_arguments(int argc, char **argv) {
   return result;
 }
 void validate_options(const options &opts) {
-  if (opts.original_dir == nullptr) {
+  bool invalid = false;
+  if ((invalid = (opts.original_dir == nullptr))) {
     std::cerr << "Origin directory not specified" << std::endl;
-    exit(1);
   }
-  if (opts.destination_dir == nullptr) {
+  if ((invalid = (opts.destination_dir == nullptr))) {
     std::cerr << "Destination directory not specified" << std::endl;
-    exit(1);
   }
-  if (opts.chunk_size < 0) {
+  if ((invalid = (opts.chunk_size < 0))) {
     std::cerr << "chunk size cannot be negative" << std::endl;
-    exit(1);
   }
+  if (invalid)
+    exit(1);
+}
+void print_help(const char *argv) {
+  std::cout << "Syntax: " << argv[0] << " [options] (source directory) (destination directory)\n"
+            << "Options:\n"
+            << "\t--disregard-permissions\t Do not copy permissions. This is usually not what you want.\n"
+            << "\t--silent\t Don't print anything\n"
+            << "\t--loud\t On by default. Print things\n"
+            << "\t--chunk-size <size>\t Set the amount copied at once defaults to " << std::numeric_limits<ssize_t>::max() << "\n"
+            << "\t--preserve-permissions\tCopy the original permissions from each file and directory\n"
+            << std::endl;
+  exit(0);
 }
