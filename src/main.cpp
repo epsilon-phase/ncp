@@ -114,11 +114,11 @@ void sendfile_copy(int original, int newfile, const struct stat &stat, const opt
   off_t copied = 0;
   ftruncate(newfile, stat.st_size);
   while (copied < stat.st_size) {
-    if (-1 == sendfile(newfile, original, &copied, stat.st_size - copied)) {
+    if (-1 == sendfile(newfile, original, &copied, std::min(options.chunk_size, stat.st_size - copied))) {
       handle_error("SENDFILE");
     }
     if (options.print_info)
-      std::cout << "Sent " << copied / 0x7ffff000 << " chunks" << '\r' << std::flush;
+      std::cout << "Sent " << copied / std::min(0x7ffff000, options.chunk_size) << " chunks" << '\r' << std::flush;
   }
   if (options.print_info)
     std::cout << std::endl;
@@ -170,14 +170,23 @@ options parse_arguments(int argc, char **argv) {
 }
 void validate_options(const options &opts) {
   bool invalid = false;
-  if ((invalid = (opts.original_dir == nullptr))) {
+  if (opts.original_dir == nullptr) {
     std::cerr << "Origin directory not specified" << std::endl;
+    invalid = true;
+  } else if (fs::is_directory(opts.original_dir)) {
+    std::cerr << "Origin directory '" << opts.original_dir << "' does not exist" << std::endl;
+    invalid = true;
   }
-  if ((invalid = (opts.destination_dir == nullptr))) {
+  if (opts.destination_dir == nullptr) {
     std::cerr << "Destination directory not specified" << std::endl;
+    invalid = true;
+  } else if (fs::is_directory(opts.destination_dir)) {
+    std::cerr << "Destination directory '" << opts.destination_dir << "' does not exist" << std::endl;
+    invalid = true;
   }
-  if ((invalid = (opts.chunk_size < 0))) {
+  if (opts.chunk_size < 0) {
     std::cerr << "chunk size cannot be negative" << std::endl;
+    invalid = true;
   }
   if (invalid)
     exit(1);
