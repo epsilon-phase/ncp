@@ -8,6 +8,7 @@
 #ifdef HAS_SENDFILE
 #include <sys/sendfile.h>
 #endif
+#include <getopt.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -18,27 +19,29 @@
     exit(EXIT_FAILURE);   \
   } while (0)
 namespace fs = std::filesystem;
-void mmap_copy(int original, int newfile, const struct stat &stat);
+struct options {
+  ssize_t chunk_size = std::numeric_limits<ssize_t>::max();
+  bool print_info = true;
+  bool copy_permissions = true;
+  const char *original_dir = nullptr,
+             *destination_dir = nullptr;
+};
+void mmap_copy(int original, int newfile, const struct stat &stat, const options &opts);
 #ifdef HAS_SENDFILE
-void sendfile_copy(int original, int newfile, const struct stat &stat);
+void sendfile_copy(int original, int newfile, const struct stat &stat, const options &opts);
 #endif
+options parse_arguments(int argc, char **argv);
+void validate_options(const options &);
 int main(int argc, char **argv) {
-  if (argc != 3) {
-    std::cout << argv[0] << " [source directory] [target directory]" << std::endl;
+  auto options = parse_arguments(argc, argv);
+  validate_options(options);
+  if (!fs::is_directory(options.original_dir)) {
+    std::cout << options.original_dir << " is not a directory" << std::endl;
     return 1;
   }
-  if (!fs::is_directory(argv[1])) {
-    std::cout << argv[1] << " is not a directory" << std::endl;
-    return 1;
-  }
-  std::vector<fs::directory_entry> directories;
-  directories.push_back(fs::directory_entry(argv[1]));
 
-  fs::path other = argv[2],
-           src = argv[1];
-  long pages = sysconf(_SC_PHYS_PAGES);
-  long page_size = sysconf(_SC_PAGE_SIZE);
-  long memory_available = (pages * page_size) / 20;
+  fs::path other = options.destination_dir,
+           src = options.original_dir;
   for (auto i : fs::recursive_directory_iterator(src, fs::directory_options::skip_permission_denied)) {
 
     fs::path newpath = other;
@@ -55,7 +58,8 @@ int main(int argc, char **argv) {
     }
     if (i.is_directory()) {
       fs::create_directory(newpath);
-      fs::permissions(newpath, original_perms);
+      if (options.copy_permissions)
+        fs::permissions(newpath, original_perms);
     } else if (i.is_regular_file() && !fs::exists(newpath)) {
       std::cout << fs::absolute(i.path()) << "->" << fs::absolute(newpath) << std::endl;
       int original = open(fs::absolute(i.path()).c_str(), O_RDONLY);
@@ -70,47 +74,116 @@ int main(int argc, char **argv) {
       if (newfile == -1) {
         handle_error("NEWFILE");
       }
+      //File should exist by this point,
+      //but sendfile and mmap don't like size 0 files
       if (stat.st_size > 0) {
-#ifndef HAS_SENDFILE
-        mmap_copy(original, newfile, stat);
+#ifdef HAS_SENDFILE
+        sendfile_copy(original, newfile, stat, options);
 #else
-        sendfile_copy(original, newfile, stat);
+        mmap_copy(original, newfile, stat, options);
 #endif
       }
       close(original);
       close(newfile);
-      fs::permissions(newpath, original_perms);
+      if (options.copy_permissions)
+        fs::permissions(newpath, original_perms);
     }
   }
 
   return 0;
 }
-void mmap_copy(int original, int newfile, const struct stat &stat) {
+void mmap_copy(int original, int newfile, const struct stat &stat, const options &options) {
   ftruncate(newfile, stat.st_size);
   char *original_data;
   original_data = (char *)mmap(NULL, stat.st_size, PROT_READ, MAP_PRIVATE, original, 0);
   if (original_data == MAP_FAILED) {
     std::cerr << "Options: size=" << stat.st_size << std::endl;
-    handle_error("mmap");
+    handle_error("mmap ORIGINAL");
   }
   char *new_data;
   new_data = (char *)mmap(NULL, stat.st_size, PROT_WRITE | PROT_READ, MAP_SHARED, newfile, 0);
   if (new_data == MAP_FAILED)
-    handle_error("mmap");
+    handle_error("mmap NEW");
   memcpy(new_data, original_data, stat.st_size);
   munmap(new_data, stat.st_size);
   munmap(original_data, stat.st_size);
 }
 #ifdef HAS_SENDFILE
-void sendfile_copy(int original, int newfile, const struct stat &stat) {
+void sendfile_copy(int original, int newfile, const struct stat &stat, const options &options) {
   off_t copied = 0;
   ftruncate(newfile, stat.st_size);
   while (copied < stat.st_size) {
     if (-1 == sendfile(newfile, original, &copied, stat.st_size - copied)) {
       handle_error("SENDFILE");
     }
-    std::cout << "Sent " << copied / 0x7ffff000 << " chunks" << '\r' << std::flush;
+    if (options.print_info)
+      std::cout << "Sent " << copied / 0x7ffff000 << " chunks" << '\r' << std::flush;
   }
-  std::cout << std::endl;
+  if (options.print_info)
+    std::cout << std::endl;
 }
 #endif
+options parse_arguments(int argc, char **argv) {
+  options result;
+  static struct option long_options[] = {
+      {"help", no_argument, nullptr, 'h'},
+      {"preserve-permissions", no_argument, reinterpret_cast<int *>(&result.copy_permissions), true},
+      {"disregard-permissions", no_argument, reinterpret_cast<int *>(&result.copy_permissions), false},
+      {"silent", no_argument, reinterpret_cast<int *>(&result.print_info), false},
+      {"loud", no_argument, reinterpret_cast<int *>(&result.print_info), true},
+      {"chunk-size", required_argument, 0, 'c'},
+      {0, 0, 0, 0}};
+  int option_index;
+  int c;
+  while (1) {
+    c = getopt_long(argc, argv, "hc:", long_options, &option_index);
+    if (c == -1)
+      break;
+    switch (c) {
+    case 0:
+      if (long_options[option_index].flag != 0)
+        break;
+      break;
+    case 'h':
+      std::cout << "Syntax: " << argv[0] << " [options] (source directory) (destination directory)\n"
+                << "Options:\n"
+                << "\t--disregard-permissions\t Do not copy permissions. This is usually not what you want."
+                << "\t--silent\t Don't print anything\n"
+                << "\t--loud\t On by default. Print things\n"
+                << "\t--chunk-size <size>\t Set the amount copied at once defaults to " << std::numeric_limits<ssize_t>::max() << "\n"
+                << "\t--preserve-permissions\tCopy the original permissions from each file and directory\n"
+                << std::endl;
+      exit(0);
+      break;
+    case 'c': {
+      auto q = strtol(optarg, NULL, 10);
+      result.chunk_size = q;
+    } break;
+    }
+  }
+  if (optind < argc) {
+    while (optind < argc) {
+      if (result.original_dir == nullptr)
+        result.original_dir = argv[optind++];
+      else if (result.destination_dir == nullptr)
+        result.destination_dir = argv[optind++];
+      else
+        optind++;
+    }
+  }
+  return result;
+}
+void validate_options(const options &opts) {
+  if (opts.original_dir == nullptr) {
+    std::cerr << "Origin directory not specified" << std::endl;
+    exit(1);
+  }
+  if (opts.destination_dir == nullptr) {
+    std::cerr << "Destination directory not specified" << std::endl;
+    exit(1);
+  }
+  if (opts.chunk_size < 0) {
+    std::cerr << "chunk size cannot be negative" << std::endl;
+    exit(1);
+  }
+}
