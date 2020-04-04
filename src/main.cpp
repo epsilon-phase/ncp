@@ -121,9 +121,10 @@ void mmap_copy(int original, int newfile, const struct stat &stat, const options
     handle_error("mmap ORIGINAL");
   }
   char *new_data;
+  new_data = (char *)mmap(NULL, stat.st_size, PROT_WRITE | PROT_READ, MAP_SHARED, newfile, 0);
   char *offset_out = new_data,
        *offset_in = original_data;
-  new_data = (char *)mmap(NULL, stat.st_size, PROT_WRITE | PROT_READ, MAP_SHARED, newfile, 0);
+
   if (new_data == MAP_FAILED)
     handle_error("mmap NEW");
   ssize_t copied = 0,
@@ -158,7 +159,7 @@ options parse_arguments(int argc, char **argv) {
   options result;
   if (argc == 1)
     print_help(argv[0]);
-  static struct option long_options[] = {
+  struct option long_options[] = {
       {"help", no_argument, nullptr, 'h'},
       {"preserve-permissions", no_argument, reinterpret_cast<int *>(&result.copy_permissions), true},
       {"disregard-permissions", no_argument, reinterpret_cast<int *>(&result.copy_permissions), false},
