@@ -8,13 +8,13 @@
 #ifdef HAS_SENDFILE
 #include <sys/sendfile.h>
 #endif
+#include <chrono>
 #include <cmath>
 #include <getopt.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <vector>
 #define handle_error(msg) \
   do {                    \
     perror(msg);          \
@@ -22,8 +22,9 @@
   } while (0)
 namespace fs = std::filesystem;
 
+const int speed_samples = 30;
 struct options {
-  ssize_t chunk_size = std::numeric_limits<ssize_t>::max();
+  ssize_t chunk_size = 512 * 1024 * 1024;
   bool print_info = true;
   bool copy_permissions = true;
   /**
@@ -31,17 +32,38 @@ struct options {
    **/
   bool ansi_escape = true;
   bool is_copying = false;
+  bool calibrate_speed = false;
   const char *original_dir = nullptr,
              *destination_dir = nullptr;
+  std::chrono::time_point<std::chrono::steady_clock> last_copy;
+  ssize_t last_copy_size[speed_samples],
+      total_copied = 0;
+  double last_copy_speed[speed_samples];
+  double update_speed = 0.25;
   fs::path current_dest;
+  void add_sample(ssize_t);
+  void add_sample(double);
+  ssize_t avg_chunk_size() const;
+  double avg_chunk_speed() const;
+  void track_copied(ssize_t);
 };
 static volatile bool is_killed = false;
 void handle_termination(int sigterm);
 void print_help(const char *progname);
-void mmap_copy(int original, int newfile, const struct stat &stat, const options &opts);
+void perf_mark(options &);
+void perf_update(options &);
+void mmap_copy(int original, int newfile, const struct stat &stat, options &opts);
 #ifdef HAS_SENDFILE
-void sendfile_copy(int original, int newfile, const struct stat &stat, const options &opts);
+void sendfile_copy(int original, int newfile, const struct stat &stat, options &opts);
 #endif
+void copy_file(int original, int newfile, const struct stat &stat, options &options) {
+#ifdef HAS_SENDFILE
+  sendfile_copy(original, newfile, stat, options);
+#else
+  mmap_copy(original, newfile, stat, options);
+#endif
+}
+void print_size_unit(ssize_t);
 options parse_arguments(int argc, char **argv);
 void validate_options(const options &);
 void print_progress(ssize_t copied, ssize_t total, const options &);
@@ -100,11 +122,7 @@ int main(int argc, char **argv) {
       //but sendfile and mmap don't like size 0 files
       if (stat.st_size > 0) {
         options.is_copying = true;
-#ifdef HAS_SENDFILE
-        sendfile_copy(original, newfile, stat, options);
-#else
-        mmap_copy(original, newfile, stat, options);
-#endif
+        copy_file(original, newfile, stat, options);
         options.is_copying = false;
       }
       handle_death(original, newfile, options);
@@ -115,7 +133,7 @@ int main(int argc, char **argv) {
 
   return 0;
 }
-void mmap_copy(int original, int newfile, const struct stat &stat, const options &options) {
+void mmap_copy(int original, int newfile, const struct stat &stat, options &options) {
   ftruncate(newfile, stat.st_size);
   char *original_data;
   original_data = (char *)mmap(NULL, stat.st_size, PROT_READ, MAP_PRIVATE, original, 0);
@@ -134,7 +152,10 @@ void mmap_copy(int original, int newfile, const struct stat &stat, const options
           chunk_size;
   while (copied < stat.st_size) {
     chunk_size = std::min(stat.st_size - copied, options.chunk_size);
+    perf_mark(options);
     memcpy(offset_out, offset_in, chunk_size);
+    options.add_sample(chunk_size);
+    perf_update(options);
     copied += chunk_size;
     offset_in += chunk_size;
     offset_out += chunk_size;
@@ -145,14 +166,16 @@ void mmap_copy(int original, int newfile, const struct stat &stat, const options
   munmap(original_data, stat.st_size);
 }
 #ifdef HAS_SENDFILE
-void sendfile_copy(int original, int newfile, const struct stat &stat, const options &options) {
+void sendfile_copy(int original, int newfile, const struct stat &stat, options &options) {
   off_t copied = 0;
   ftruncate(newfile, stat.st_size);
-  int chunks = 0;
   while (copied < stat.st_size) {
+    perf_mark(options);
     if (-1 == sendfile(newfile, original, &copied, std::min(options.chunk_size, stat.st_size - copied))) {
       handle_error("SENDFILE");
     }
+    options.add_sample(std::min(options.chunk_size, stat.st_size - copied));
+    perf_update(options);
     print_progress(copied, stat.st_size, options);
     handle_death(original, newfile, options);
   }
@@ -169,6 +192,8 @@ options parse_arguments(int argc, char **argv) {
       {"silent", no_argument, reinterpret_cast<int *>(&result.print_info), false},
       {"loud", no_argument, reinterpret_cast<int *>(&result.print_info), true},
       {"chunk-size", required_argument, 0, 'c'},
+      {"calibrate-speed", no_argument, reinterpret_cast<int *>(&result.calibrate_speed), true},
+      {"update-speed", required_argument, 0, 'u'},
       {0, 0, 0, 0}};
   int option_index;
   int c;
@@ -184,6 +209,11 @@ options parse_arguments(int argc, char **argv) {
     case 'h':
       print_help(argv[0]);
       break;
+    case 'u': {
+      char *end = nullptr;
+      auto q = strtod(optarg, &end);
+      result.update_speed = 1.0 / q;
+    } break;
     case 'c': {
       char *end = nullptr;
       auto q = strtol(optarg, &end, 10);
@@ -216,6 +246,10 @@ options parse_arguments(int argc, char **argv) {
       else
         optind++;
     }
+  }
+  for (int i = 0; i < speed_samples; i++) {
+    result.last_copy_size[i] = result.chunk_size;
+    result.last_copy_speed[i] = 1.0;
   }
   return result;
 }
@@ -251,6 +285,8 @@ void print_help(const char *argv) {
             << "\t--chunk-size <size>\t Set the amount copied at once defaults to " << std::numeric_limits<ssize_t>::max() << " bytes.\n"
             << "\t\t Add a suffix of k,m, or g to specify the unit,\n"
             << "\t\t since it's not fun to remember the exact size of each of those units\n"
+            << "\t--calibrate-speed\tAttempts to maintain a consistent update speed by adjusting chunk sizes.\n"
+            << "\t--update-speed <N>\tAttempts to maintain N update prints per second. Only has effects if the --calibrate-speed flag is also specified\n"
             << "\t--preserve-permissions\tCopy the original permissions from each file and directory\n"
             << std::endl;
   exit(0);
@@ -261,7 +297,14 @@ void print_progress(ssize_t copied, ssize_t total, const options &options) {
   double progress = copied;
   progress /= total;
   progress *= 100.0;
-  std::cout << "\x1b[1000D\x1b[0K" << options.current_dest << std::setw(8) << std::setprecision(5) << progress << "%" << std::flush;
+  std::cout << "\x1b[1000D\x1b[0K" << options.current_dest.filename() << std::setw(8) << std::setprecision(5) << progress << "%";
+  if (options.calibrate_speed) {
+    std::cout << " cs=";
+    print_size_unit(options.chunk_size);
+  }
+  std::cout << " copied ";
+  print_size_unit(options.total_copied);
+  std::cout << std::flush;
 }
 void handle_termination(int sigterm) {
   is_killed = true;
@@ -275,4 +318,57 @@ void handle_death(int original_fd, int new_fd, const options &options) {
     fs::remove(options.current_dest);
   }
   exit(1);
+}
+void perf_mark(options &options) {
+  options.last_copy = std::chrono::steady_clock::now();
+}
+void perf_update(options &options) {
+  if (!options.calibrate_speed)
+    return;
+  auto current_time = std::chrono::steady_clock::now();
+  std::chrono::duration<double> duration = current_time - options.last_copy;
+  options.add_sample(duration.count());
+  ssize_t new_size = std::floor(options.avg_chunk_size() / options.avg_chunk_speed()) * options.update_speed;
+  //std::cout << "Changing chunk size from " << options.chunk_size << " to " << new_size << std::endl;
+  options.chunk_size = std::max(1024l, (ssize_t)std::floor(new_size));
+}
+void print_size_unit(ssize_t s) {
+  std::cout << std::setprecision(4);
+  if (s >= 1024 * 1024 * 1024l * 1024) {
+    std::cout << s / (1024.0 * 1024 * 1024 * 1024) << "Tb";
+  } else if (s >= 1024 * 1024 * 1024) {
+    std::cout << s / (1024.0 * 1024 * 1024) << "Gb";
+  } else if (s >= 1024 * 1024) {
+    std::cout << s / (1024.0 * 1024.0) << "Mb";
+  } else {
+    std::cout << s / 1024.0 << "Kb";
+  }
+}
+void options::add_sample(ssize_t s) {
+  for (int i = speed_samples - 1; i > 0; i--) {
+    last_copy_size[i] = last_copy_size[i - 1];
+  }
+  last_copy_size[0] = s;
+  track_copied(s);
+}
+void options::add_sample(double s) {
+  for (int i = speed_samples - 1; i > 0; i--) {
+    last_copy_speed[i] = last_copy_speed[i - 1];
+  }
+  last_copy_speed[0] = s;
+}
+ssize_t options::avg_chunk_size() const {
+  ssize_t s = 0;
+  for (int i = 0; i < speed_samples; i++)
+    s += last_copy_size[i];
+  return s / speed_samples;
+}
+double options::avg_chunk_speed() const {
+  double s = 0;
+  for (int i = 0; i < speed_samples; i++)
+    s += last_copy_speed[i];
+  return s / speed_samples;
+}
+void options::track_copied(ssize_t s) {
+  total_copied += s;
 }
