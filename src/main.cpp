@@ -32,14 +32,15 @@ struct options {
    **/
   bool ansi_escape = true;
   bool is_copying = false;
-  bool calibrate_speed = false;
+  bool calibrate_speed = true;
+  bool overwrite = true;
   const char *original_dir = nullptr,
              *destination_dir = nullptr;
   std::chrono::time_point<std::chrono::steady_clock> last_copy;
   ssize_t last_copy_size[speed_samples],
       total_copied = 0;
   double last_copy_speed[speed_samples];
-  double update_speed = 0.25;
+  double update_speed = 1 / 60.0;
   fs::path current_dest;
   void add_sample(ssize_t);
   void add_sample(double);
@@ -68,6 +69,8 @@ options parse_arguments(int argc, char **argv);
 void validate_options(const options &);
 void print_progress(ssize_t copied, ssize_t total, const options &);
 void handle_death(int, int, const options &);
+void copy_directory(options &options, fs::path &other, fs::path &src);
+void copy_single_file(options &options, const fs::path &other, const fs::path &src);
 int main(int argc, char **argv) {
   auto options = parse_arguments(argc, argv);
   validate_options(options);
@@ -81,12 +84,21 @@ int main(int argc, char **argv) {
   fs::path other = options.destination_dir,
            src = options.original_dir;
   std::cout << "Currently working on:" << std::endl;
+  if (fs::is_directory(src)) {
+    copy_directory(options, other, src);
+  } else if (fs::is_regular_file(src)) {
+    copy_single_file(options, other, src);
+  }
+
+  return 0;
+}
+
+void copy_directory(options &options, fs::path &other, fs::path &src) {
   for (auto i : fs::recursive_directory_iterator(src, fs::directory_options::skip_permission_denied)) {
     fs::path newpath = other;
     fs::path::iterator a = src.begin(), b = i.path().begin();
     auto original_perms = fs::status(i.path()).permissions();
-    // std::cout << i.path() << std::endl;
-    while (a != src.end() && *a != "" /*&& b != --i.path().end()*/) {
+    while (a != src.end() && *a != "") {
       a++;
       b++;
     }
@@ -98,41 +110,47 @@ int main(int argc, char **argv) {
       fs::create_directory(newpath);
       if (options.copy_permissions)
         fs::permissions(newpath, original_perms);
-    } else if (i.is_regular_file() && !fs::exists(newpath)) {
-      if (options.print_info)
-        std::cout << "\x1b[1A\x1b[1000D\x1b[0K" << fs::absolute(i.path()) << "->" << fs::absolute(newpath) << std::endl;
-      int original = open(fs::absolute(i.path()).c_str(), O_RDONLY);
-      if (original == -1) {
-        handle_error("ORIGINAL FILE");
+    } else if (i.is_regular_file()) {
+      if (fs::exists(newpath) && !options.overwrite) {
+        continue;
       }
-      struct stat stat;
-      if (-1 == fstat(original, &stat)) {
-        handle_error("FSTAT");
-      }
-      int newfile = open(fs::absolute(newpath).c_str(), O_CREAT | O_RDWR);
-      options.current_dest = newpath;
-      if (newfile == -1) {
-        handle_error("NEWFILE");
-      }
-      //Doing this permits running 'rm' on the resulting file, even if the program aborts prior to
-      //finishing the copy
-      if (options.copy_permissions)
-        fs::permissions(newpath, original_perms);
-      //File should exist by this point,
-      //but sendfile and mmap don't like size 0 files
-      if (stat.st_size > 0) {
-        options.is_copying = true;
-        copy_file(original, newfile, stat, options);
-        options.is_copying = false;
-      }
-      handle_death(original, newfile, options);
-      close(original);
-      close(newfile);
+      copy_single_file(options, newpath, i.path());
     }
   }
-
-  return 0;
 }
+void copy_single_file(options &options, const fs::path &other, const fs::path &src) {
+  auto original_perms = fs::status(src).permissions();
+  if (options.print_info)
+    std::cout << "\x1b[1A\x1b[1000D\x1b[0K" << fs::absolute(src) << "->" << fs::absolute(other) << std::endl;
+  int original = open(fs::absolute(src).c_str(), O_RDONLY);
+  if (original == -1) {
+    handle_error("ORIGINAL FILE");
+  }
+  struct stat stat;
+  if (-1 == fstat(original, &stat)) {
+    handle_error("FSTAT");
+  }
+  int newfile = open(fs::absolute(other).c_str(), O_CREAT | O_RDWR);
+  options.current_dest = other;
+  if (newfile == -1) {
+    handle_error("NEWFILE");
+  }
+  // Doing this permits running 'rm' on the resulting file, even if the program aborts prior to
+  // finishing the copy
+  if (options.copy_permissions)
+    fs::permissions(other, original_perms);
+  // File should exist by this point,
+  // but sendfile and mmap don't like size 0 files
+  if (stat.st_size > 0) {
+    options.is_copying = true;
+    copy_file(original, newfile, stat, options);
+    options.is_copying = false;
+  }
+  handle_death(original, newfile, options);
+  close(original);
+  close(newfile);
+}
+
 void mmap_copy(int original, int newfile, const struct stat &stat, options &options) {
   ftruncate(newfile, stat.st_size);
   char *original_data;
@@ -194,6 +212,7 @@ options parse_arguments(int argc, char **argv) {
       {"chunk-size", required_argument, 0, 'c'},
       {"calibrate-speed", no_argument, reinterpret_cast<int *>(&result.calibrate_speed), true},
       {"update-speed", required_argument, 0, 'u'},
+      {"no-clobber", no_argument, reinterpret_cast<int *>(&result.overwrite), false},
       {0, 0, 0, 0}};
   int option_index;
   int c;
@@ -218,7 +237,7 @@ options parse_arguments(int argc, char **argv) {
       char *end = nullptr;
       auto q = strtol(optarg, &end, 10);
       if (end != nullptr) {
-        //fallthrough is good actually :3
+        // fallthrough is good actually :3
         switch (*end) {
         case 'g':
         case 'G':
@@ -255,17 +274,19 @@ options parse_arguments(int argc, char **argv) {
 }
 void validate_options(const options &opts) {
   bool invalid = false;
+  bool operating_on_directory = false;
   if (opts.original_dir == nullptr) {
     std::cerr << "Origin directory not specified" << std::endl;
     invalid = true;
-  } else if (!fs::is_directory(opts.original_dir)) {
+  } else if (!fs::exists(opts.original_dir)) {
     std::cerr << "Origin directory '" << opts.original_dir << "' does not exist" << std::endl;
     invalid = true;
   }
+  operating_on_directory = fs::is_directory(opts.original_dir);
   if (opts.destination_dir == nullptr) {
     std::cerr << "Destination directory not specified" << std::endl;
     invalid = true;
-  } else if (!fs::is_directory(opts.destination_dir)) {
+  } else if (operating_on_directory && !fs::is_directory(opts.destination_dir)) {
     std::cerr << "Destination directory '" << opts.destination_dir << "' does not exist" << std::endl;
     invalid = true;
   }
@@ -329,7 +350,7 @@ void perf_update(options &options) {
   std::chrono::duration<double> duration = current_time - options.last_copy;
   options.add_sample(duration.count());
   ssize_t new_size = std::floor(options.avg_chunk_size() / options.avg_chunk_speed()) * options.update_speed;
-  //std::cout << "Changing chunk size from " << options.chunk_size << " to " << new_size << std::endl;
+  // std::cout << "Changing chunk size from " << options.chunk_size << " to " << new_size << std::endl;
   options.chunk_size = std::max(1024l, (ssize_t)std::floor(new_size));
 }
 void print_size_unit(ssize_t s) {
@@ -371,4 +392,4 @@ double options::avg_chunk_speed() const {
 }
 void options::track_copied(ssize_t s) {
   total_copied += s;
-}
+} 
